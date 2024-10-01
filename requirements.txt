@@ -1,0 +1,7 @@
+streamlit
+llmware
+torch
+transfomers
+pandas
+docx2pdf
+openpyxl

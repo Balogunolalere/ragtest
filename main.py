@@ -1,5 +1,9 @@
 import os
+import json
+import pandas as pd
 import streamlit as st
+import transformers
+import torch
 from llmware.resources import CustomTable
 from llmware.models import ModelCatalog
 from llmware.prompts import Prompt
@@ -7,43 +11,46 @@ from llmware.parsers import Parser
 from llmware.configs import LLMWareConfig
 from llmware.agents import LLMfx
 from llmware.setup import Setup
-import pandas as pd
-from docx2pdf import convert
 
 # Keeps a running state of any csv tables that have been loaded in the session to avoid duplicated inserts
 if "loaded_tables" not in st.session_state:
     st.session_state["loaded_tables"] = []
 
-def convert_to_pdf(fp, doc):
-    """Convert DOC/DOCX to PDF"""
-    if doc.lower().endswith(('.doc', '.docx')):
-        pdf_path = os.path.join(fp, os.path.splitext(doc)[0] + '.pdf')
-        convert(os.path.join(fp, doc), pdf_path)
-        return pdf_path
-    return os.path.join(fp, doc)
-
 def convert_to_csv(fp, file):
-    """Convert JSON or Excel to CSV"""
-    if file.lower().endswith(('.json', '.xlsx', '.xls')):
-        csv_path = os.path.join(fp, os.path.splitext(file)[0] + '.csv')
-        if file.lower().endswith('.json'):
-            df = pd.read_json(os.path.join(fp, file))
-        else:
-            df = pd.read_excel(os.path.join(fp, file))
-        df.to_csv(csv_path, index=False)
-        return csv_path
-    return os.path.join(fp, file)
+    file_name, file_extension = os.path.splitext(file)
+    csv_file = f"{file_name}.csv"
+    
+    if file_extension.lower() == '.json':
+        with open(os.path.join(fp, file), 'r') as json_file:
+            data = json.load(json_file)
+        df = pd.DataFrame(data)
+    elif file_extension.lower() in ['.xlsx', '.xls']:
+        df = pd.read_excel(os.path.join(fp, file))
+    else:
+        return None
+
+    csv_path = os.path.join(fp, csv_file)
+    df.to_csv(csv_path, index=False)
+    return csv_file
 
 def build_table(db=None, table_name=None, load_fp=None, load_file=None):
-    """ Simple example script to take a CSV or JSON/JSONL and create a DB Table. """
     if not table_name:
         return 0
 
-    # build the table only once - if name already found, do not add to table
     if table_name in st.session_state["loaded_tables"]:
         return 0
 
     custom_table = CustomTable(db=db, table_name=table_name)
+
+    file_extension = os.path.splitext(load_file)[1].lower()
+    if file_extension in ['.json', '.xlsx', '.xls']:
+        csv_file = convert_to_csv(load_fp, load_file)
+        if csv_file:
+            load_file = csv_file
+        else:
+            print("Failed to convert file to CSV")
+            return -1
+
     analysis = custom_table.validate_csv(load_fp, load_file)
     print("update: analysis from validate_csv: ", analysis)
 
@@ -61,49 +68,37 @@ def build_table(db=None, table_name=None, load_fp=None, load_file=None):
     for x in range(0, sample_range):
         print("update: sample rows: ", x, custom_table.rows[x])
 
-    # stress the schema data type and remediate - use more samples for more accuracy
     updated_schema = custom_table.test_and_remediate_schema(samples=20, auto_remediate=True)
-
     print("update: updated schema: ", updated_schema)
 
-    # insert the rows in the DB
     custom_table.insert_rows()
-
     st.session_state["loaded_tables"].append(table_name)
 
     return len(custom_table.rows)
 
 @st.cache_resource
 def load_reranker_model():
-    """ Loads the reranker model used in the RAG process to rank the semantic similarity between all of the
-    parsed text chunks and the user query. """
     reranker_model = ModelCatalog().load_model("jina-reranker-turbo")
     return reranker_model
 
 @st.cache_resource
 def load_prompt_model():
-    """ Loads the core RAG model used for fact-based question-answering against the source materials. """
     prompter = Prompt().load_model("bling-phi-3-gguf", temperature=0.0, sample=False)
     return prompter
 
 @st.cache_resource
 def load_agent_model():
-    """ Loads the Text2SQL model used for querying the CSV table. """
     agent = LLMfx()
     agent.load_tool("sql", sample=False, get_logits=True, temperature=0.0)
     return agent
 
 @st.cache_resource
 def parse_file(fp, doc):
-    """ Executes a parsing job of a newly uploaded file, and saves the parser out as a set of text chunks
-    with metadata. """
     parser_output = Parser().parse_one(fp, doc, save_history=False)
     st.cache_resource.clear()
     return parser_output
 
 def get_rag_response(prompt, parser_output, reranker_model, prompter):
-    """ Executes a RAG response. """
-    # if the number of text chunks is small, then will skip the reranker
     if len(parser_output) > 3:
         output = reranker_model.inference(prompt, parser_output, top_n=10, relevance_threshold=0.25)
     else:
@@ -116,13 +111,8 @@ def get_rag_response(prompt, parser_output, reranker_model, prompter):
     if len(output) > use_top:
         output = output[0:use_top]
 
-    # create the source from the top 3 text chunks
     sources = prompter.add_source_query_results(output)
-
-    # run the inference on the model with the source automatically packaged and attached
     responses = prompter.prompt_with_source(prompt, prompt_name="default_with_context")
-
-    # execute post-inference fact and source checking
     source_check = prompter.evidence_check_sources(responses)
     numbers_check = prompter.evidence_check_numbers(responses)
     nf_check = prompter.classify_not_found_response(responses, parse_response=True, evidence_match=False, ask_the_model=False)
@@ -130,9 +120,7 @@ def get_rag_response(prompt, parser_output, reranker_model, prompter):
     bot_response = ""
     for i, resp in enumerate(responses):
         bot_response = resp['llm_response']
-
         print("bot response - llm_response raw - ", bot_response)
-
         add_sources = True
 
         if "not_found_classification" in nf_check[i]:
@@ -158,7 +146,6 @@ def get_rag_response(prompt, parser_output, reranker_model, prompter):
                             if "page_num" in fc_entries:
                                 numbers_output += "Page Num: " + fc_entries["page_num"] + "\n\n"
                             count += 1
-
                 bot_response += "\n\n" + numbers_output
 
             source_output = ""
@@ -175,18 +162,12 @@ def get_rag_response(prompt, parser_output, reranker_model, prompter):
                             source_output += "Source: " + fc["source"] + "\n\n"
                         if "page_num" in fc:
                             source_output += "Page Num: " + str(fc["page_num"]) + "\n\n"
-
                     bot_response += "\n\n" + source_output
 
     prompter.clear_source_materials()
-
     return bot_response
 
 def get_sql_response(prompt, agent, db=None, table_name=None):
-    """ Executes a Text-to-SQL inference, and then also queries the database and returns the database query result. """
-    # note: there is an optional magic word " #SHOW" at the end of a user query, which is stripped from the query
-    # before generating the SQL, but is then used by the UI to display the SQL command produced.
-
     show_sql = False
     bot_response = ""
 
@@ -196,7 +177,6 @@ def get_sql_response(prompt, agent, db=None, table_name=None):
 
     model_response = agent.query_custom_table(prompt, db=db, table=table_name)
 
-    # insert additional error checking / post-processing of output here
     error_handle = False
 
     try:
@@ -227,19 +207,15 @@ def biz_bot_ui_app(db="postgres", table_name=None, fp=None, doc=None):
 
     if os.path.exists(os.path.join(fp, doc)):
         if not parser_output:
-            # Convert DOC/DOCX to PDF before parsing
-            pdf_path = convert_to_pdf(fp, doc)
-            parser_output = Parser().parse_one(fp, os.path.basename(pdf_path), save_history=False)
+            parser_output = Parser().parse_one(fp, doc, save_history=False)
 
     prompter = load_prompt_model()
     reranker_model = load_reranker_model()
     agent = load_agent_model()
 
-    # initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # display chat messages from history on app rerun
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -248,37 +224,28 @@ def biz_bot_ui_app(db="postgres", table_name=None, fp=None, doc=None):
         st.write("Biz Bot")
         model_type = st.selectbox("Pick your mode", ("RAG", "SQL"), index=0)
 
-        uploaded_doc = st.file_uploader("Upload Document (PDF, DOC, DOCX)")
-        uploaded_table = st.file_uploader("Upload Table (CSV, JSON, XLSX, XLS)")
+        uploaded_doc = st.file_uploader("Upload Document", type=["pdf"])
+        uploaded_table = st.file_uploader("Upload Table", type=["csv", "json", "xlsx", "xls"])
 
         if uploaded_doc:
             fp = LLMWareConfig().get_llmware_path()
             doc = uploaded_doc.name
-            f = open(os.path.join(fp, doc), "wb")
-            f.write(uploaded_doc.getvalue())
-            f.close()
-            
-            # Convert DOC/DOCX to PDF
-            pdf_path = convert_to_pdf(fp, doc)
-            parser_output = parse_file(fp, os.path.basename(pdf_path))
+            with open(os.path.join(fp, doc), "wb") as f:
+                f.write(uploaded_doc.getvalue())
+            parser_output = parse_file(fp, doc)
             st.write(f"Document Parsed and Ready - {len(parser_output)}")
 
         if uploaded_table:
             fp = LLMWareConfig().get_llmware_path()
             tab = uploaded_table.name
-            f = open(os.path.join(fp, tab), "wb")
-            f.write(uploaded_table.getvalue())
-            f.close()
-            
-            # Convert JSON/Excel to CSV
-            csv_path = convert_to_csv(fp, tab)
-            table_name = os.path.splitext(os.path.basename(csv_path))[0]
-            st.write("Building Table - ", os.path.basename(csv_path), table_name)
+            with open(os.path.join(fp, tab), "wb") as f:
+                f.write(uploaded_table.getvalue())
+            table_name = os.path.splitext(tab)[0]
+            st.write("Building Table - ", tab, table_name)
             st.write(st.session_state['loaded_tables'])
-            row_count = build_table(db=db, table_name=table_name, load_fp=fp, load_file=os.path.basename(csv_path))
+            row_count = build_table(db=db, table_name=table_name, load_fp=fp, load_file=tab)
             st.write(f"Completed - Table - {table_name} - Rows - {row_count} - is Ready.")
 
-    # accept user input
     prompt = st.chat_input("Say something")
     if prompt:
         with st.chat_message("user"):
@@ -298,27 +265,14 @@ def biz_bot_ui_app(db="postgres", table_name=None, fp=None, doc=None):
     return 0
 
 if __name__ == "__main__":
-    # note: there is a hidden 'magic' command in the chatbot - if you add " #SHOW" at the end of your query,
-    # then it will display the SQL command that was generated (very useful for debugging)
-
     db = "sqlite"
     table_name = "customer_table_1"
 
-    # By default, the BizBot starts with a loaded document and CSV (which can then be changed directly in the UI)
-
-    # pull customer_table.csv sample file from the same repo as this example, or alternatively
-    # substitute your own csv to get started
-
     local_csv_path = "data"
     build_table(db=db, table_name=table_name, load_fp=local_csv_path, load_file="data.csv")
-
-    # get sample agreement to use as a starting point or feel free to substitute your own document
 
     local_path = "data"
     fp = os.path.join(local_path, "data")
     fn = "complete project report.pdf"
 
     biz_bot_ui_app(db=db, table_name=table_name, fp=fp, doc=fn)
-
-    # IMPORTANT NOTE:  to run this script, follow the streamlit formalism and run from the cli, e.g.,
-    # `streamlit run biz_bot.py`
